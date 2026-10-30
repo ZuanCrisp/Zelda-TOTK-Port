@@ -1,0 +1,144 @@
+
+name: Upstream Sync and Release Mirror
+
+on:
+  workflow_dispatch:
+
+  schedule:
+    - cron: "17 */6 * * *"
+
+  push:
+    branches:
+      - main
+    paths:
+      - ".github/workflows/upstream-sync.yml"
+
+permissions:
+  contents: write
+
+concurrency:
+  group: totk-upstream-sync
+  cancel-in-progress: false
+
+jobs:
+  sync:
+    name: Sync Upstream and Mirror Latest Release
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+
+    steps:
+      - name: Checkout mirror
+        uses: actions/checkout@v4
+        with:
+          ref: main
+          fetch-depth: 0
+
+      - name: Configure Git
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+      - name: Sync main, dev and tags
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          git remote add upstream https://github.com/valentderah/totk-pc-recomp.git
+
+          git fetch origin --prune
+          git fetch upstream --prune --tags
+
+          # Keep main updated while preserving this mirror workflow.
+          git switch main
+          git merge --no-edit upstream/main
+          git push origin main
+
+          # Keep dev exactly aligned with upstream.
+          git push --force origin \
+            refs/remotes/upstream/dev:refs/heads/dev
+
+          # Copy newly available upstream tags.
+          git push origin --tags
+
+      - name: Mirror latest upstream release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          REPO="$GITHUB_REPOSITORY"
+          UPSTREAM="valentderah/totk-pc-recomp"
+
+          release_json=$(gh api "repos/$UPSTREAM/releases/latest")
+
+          TAG=$(jq -r '.tag_name' <<< "$release_json")
+          TITLE=$(jq -r '.name // .tag_name' <<< "$release_json")
+
+          jq -r '.body // ""' <<< "$release_json" > release-notes.md
+
+          git fetch upstream --tags
+          git push origin --tags
+
+          mkdir -p dist
+
+          echo "Latest upstream release: $TAG"
+
+          while IFS=$'\t' read -r name url digest; do
+            echo "Downloading: $name"
+
+            curl --fail --show-error --location \
+              --retry 3 --retry-all-errors \
+              "$url" -o "dist/$name"
+
+            test -s "dist/$name"
+
+            expected="${digest#sha256:}"
+
+            # Official checksum for the current v0.1.1 installer.
+            if [[ -z "$expected" && "$name" == "TotK-Setup-0.1.1-windows.zip" ]]; then
+              expected="194f8191e8cef2cde3b608214113757a4ee5ed3f77278f44690435f763c64f7b"
+            fi
+
+            if [[ -n "$expected" ]]; then
+              actual=$(sha256sum "dist/$name" | cut -d' ' -f1)
+              test "$actual" = "$expected"
+              echo "SHA256 verified: $name"
+            else
+              echo "No upstream SHA256 metadata published for $name"
+            fi
+
+          done < <(
+            jq -r '.assets[] | [.name, .browser_download_url, (.digest // "")] | @tsv' <<< "$release_json"
+          )
+
+          (
+            cd dist
+            if compgen -G '*' > /dev/null; then
+              sha256sum * > SHA256SUMS.txt
+            fi
+          )
+
+          # Create or update the corresponding GitHub Release.
+          if gh release view "$TAG" --repo "$REPO" >/dev/null 2>&1; then
+            gh release edit "$TAG" \
+              --repo "$REPO" \
+              --title "$TITLE" \
+              --notes-file release-notes.md
+          else
+            gh release create "$TAG" \
+              --repo "$REPO" \
+              --title "$TITLE" \
+              --notes-file release-notes.md
+          fi
+
+          shopt -s nullglob
+          assets=(dist/*)
+
+          if ((${#assets[@]})); then
+            gh release upload "$TAG" "${assets[@]}" \
+              --repo "$REPO" \
+              --clobber
+          fi
+
+          gh release view "$TAG" --repo "$REPO"
