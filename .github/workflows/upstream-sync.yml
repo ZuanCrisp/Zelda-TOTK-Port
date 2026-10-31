@@ -22,9 +22,9 @@ concurrency:
 
 jobs:
   sync:
-    name: Sync Upstream and Mirror Latest Release
+    name: Sync Branches, Tags and All Releases
     runs-on: ubuntu-latest
-    timeout-minutes: 45
+    timeout-minutes: 60
 
     steps:
       - name: Checkout mirror
@@ -43,12 +43,14 @@ jobs:
         run: |
           set -euo pipefail
 
-          git remote add upstream https://github.com/valentderah/totk-pc-recomp.git
+          UPSTREAM="https://github.com/valentderah/totk-pc-recomp.git"
+
+          git remote add upstream "$UPSTREAM"
 
           git fetch origin --prune
           git fetch upstream --prune --tags
 
-          # Keep main updated while preserving this mirror workflow.
+          # Sync main while preserving this mirror workflow.
           git switch main
           git merge --no-edit upstream/main
           git push origin main
@@ -57,10 +59,10 @@ jobs:
           git push --force origin \
             refs/remotes/upstream/dev:refs/heads/dev
 
-          # Copy newly available upstream tags.
+          # Mirror all upstream tags.
           git push origin --tags
 
-      - name: Mirror latest upstream release
+      - name: Mirror all stable and pre-releases
         env:
           GH_TOKEN: ${{ github.token }}
         shell: bash
@@ -70,75 +72,149 @@ jobs:
           REPO="$GITHUB_REPOSITORY"
           UPSTREAM="valentderah/totk-pc-recomp"
 
-          release_json=$(gh api "repos/$UPSTREAM/releases/latest")
+          echo "Fetching all upstream releases..."
 
-          TAG=$(jq -r '.tag_name' <<< "$release_json")
-          TITLE=$(jq -r '.name // .tag_name' <<< "$release_json")
+          gh api --paginate \
+            "repos/$UPSTREAM/releases?per_page=100" \
+            | jq -s 'add' > upstream-releases.json
 
-          jq -r '.body // ""' <<< "$release_json" > release-notes.md
+          mapfile -t releases < <(
+            jq -c '.[] | select(.draft == false)' upstream-releases.json
+          )
 
-          git fetch upstream --tags
-          git push origin --tags
+          echo "Found ${#releases[@]} published releases."
 
-          mkdir -p dist
+          if ((${#releases[@]} == 0)); then
+            echo "No published releases found."
+            exit 0
+          fi
 
-          echo "Latest upstream release: $TAG"
+          for release_json in "${releases[@]}"; do
 
-          while IFS=$'\t' read -r name url digest; do
-            echo "Downloading: $name"
+            TAG=$(jq -r '.tag_name' <<< "$release_json")
+            TITLE=$(jq -r '.name // .tag_name' <<< "$release_json")
+            PRERELEASE=$(jq -r '.prerelease' <<< "$release_json")
 
-            curl --fail --show-error --location \
-              --retry 3 --retry-all-errors \
-              "$url" -o "dist/$name"
+            jq -r '.body // ""' <<< "$release_json" > release-notes.md
 
-            test -s "dist/$name"
+            echo "======================================"
+            echo "Mirroring: $TAG"
+            echo "Pre-release: $PRERELEASE"
+            echo "======================================"
 
-            expected="${digest#sha256:}"
+            rm -rf dist
+            mkdir -p dist
 
-            # Official checksum for the current v0.1.1 installer.
-            if [[ -z "$expected" && "$name" == "TotK-Setup-0.1.1-windows.zip" ]]; then
-              expected="194f8191e8cef2cde3b608214113757a4ee5ed3f77278f44690435f763c64f7b"
-            fi
+            mapfile -t upstream_assets < <(
+              jq -c '.assets[]?' <<< "$release_json"
+            )
 
-            if [[ -n "$expected" ]]; then
-              actual=$(sha256sum "dist/$name" | cut -d' ' -f1)
-              test "$actual" = "$expected"
-              echo "SHA256 verified: $name"
+            for asset_json in "${upstream_assets[@]}"; do
+
+              NAME=$(jq -r '.name' <<< "$asset_json")
+              URL=$(jq -r '.browser_download_url' <<< "$asset_json")
+              DIGEST=$(jq -r '.digest // ""' <<< "$asset_json")
+
+              FILENAME=$(basename -- "$NAME")
+              FILEPATH="dist/$FILENAME"
+
+              echo "Downloading: $FILENAME"
+
+              curl --fail --show-error --location \
+                --retry 3 --retry-all-errors \
+                "$URL" -o "$FILEPATH"
+
+              test -s "$FILEPATH"
+
+              EXPECTED="${DIGEST#sha256:}"
+
+              # Official checksum for the original v0.1.1 installer.
+              if [[ -z "$EXPECTED" && "$NAME" == "TotK-Setup-0.1.1-windows.zip" ]]; then
+                EXPECTED="194f8191e8cef2cde3b608214113757a4ee5ed3f77278f44690435f763c64f7b"
+              fi
+
+              if [[ -n "$EXPECTED" ]]; then
+                ACTUAL=$(sha256sum "$FILEPATH" | cut -d' ' -f1)
+
+                if [[ "$ACTUAL" != "$EXPECTED" ]]; then
+                  echo "ERROR: SHA256 mismatch for $FILENAME"
+                  exit 1
+                fi
+
+                echo "SHA256 verified: $FILENAME"
+              else
+                echo "No official upstream SHA256 metadata for $FILENAME"
+              fi
+
+            done
+
+            # Generate our own checksum manifest.
+            (
+              cd dist
+              shopt -s nullglob
+              files=(*)
+
+              if ((${#files[@]})); then
+                sha256sum -- "${files[@]}" > SHA256SUMS.txt
+              fi
+            )
+
+            # Check whether the release already exists.
+            if RELEASE_ID=$(gh api \
+              "repos/$REPO/releases/tags/$TAG" \
+              --jq '.id' 2>/dev/null); then
+
+              echo "Updating existing release: $TAG"
+
+              jq -n \
+                --arg name "$TITLE" \
+                --rawfile body release-notes.md \
+                --argjson prerelease "$PRERELEASE" \
+                '{
+                  name: $name,
+                  body: $body,
+                  prerelease: $prerelease
+                }' > release-update.json
+
+              gh api --method PATCH \
+                "repos/$REPO/releases/$RELEASE_ID" \
+                --input release-update.json
+
             else
-              echo "No upstream SHA256 metadata published for $name"
+
+              echo "Creating new release: $TAG"
+
+              if [[ "$PRERELEASE" == "true" ]]; then
+                gh release create "$TAG" \
+                  --repo "$REPO" \
+                  --title "$TITLE" \
+                  --notes-file release-notes.md \
+                  --prerelease \
+                  --verify-tag
+              else
+                gh release create "$TAG" \
+                  --repo "$REPO" \
+                  --title "$TITLE" \
+                  --notes-file release-notes.md \
+                  --verify-tag
+              fi
+
             fi
 
-          done < <(
-            jq -r '.assets[] | [.name, .browser_download_url, (.digest // "")] | @tsv' <<< "$release_json"
-          )
+            # Upload or replace all release assets.
+            shopt -s nullglob
+            assets=(dist/*)
 
-          (
-            cd dist
-            if compgen -G '*' > /dev/null; then
-              sha256sum * > SHA256SUMS.txt
+            if ((${#assets[@]})); then
+              gh release upload "$TAG" "${assets[@]}" \
+                --repo "$REPO" \
+                --clobber
             fi
-          )
 
-          # Create or update the corresponding GitHub Release.
-          if gh release view "$TAG" --repo "$REPO" >/dev/null 2>&1; then
-            gh release edit "$TAG" \
-              --repo "$REPO" \
-              --title "$TITLE" \
-              --notes-file release-notes.md
-          else
-            gh release create "$TAG" \
-              --repo "$REPO" \
-              --title "$TITLE" \
-              --notes-file release-notes.md
-          fi
+            echo "Release successfully mirrored: $TAG"
 
-          shopt -s nullglob
-          assets=(dist/*)
+            gh release view "$TAG" --repo "$REPO"
 
-          if ((${#assets[@]})); then
-            gh release upload "$TAG" "${assets[@]}" \
-              --repo "$REPO" \
-              --clobber
-          fi
+          done
 
-          gh release view "$TAG" --repo "$REPO"
+          echo "All upstream releases mirrored successfully."
