@@ -775,6 +775,14 @@ int plat_mem_read(uint64_t addr, void *out, size_t n) {
     return ReadProcessMemory(GetCurrentProcess(), (const void *)(uintptr_t)addr, out, n, &got) && got == n;
 }
 
+// The display mode's own size: physical pixels whatever the process's DPI awareness and the display scale
+int plat_screen_size(int *w, int *h) {
+    DEVMODEW dm = {.dmSize = sizeof dm};
+    if (!EnumDisplaySettingsW(NULL, ENUM_CURRENT_SETTINGS, &dm) || !dm.dmPelsWidth || !dm.dmPelsHeight) return 0;
+    *w = (int)dm.dmPelsWidth, *h = (int)dm.dmPelsHeight;
+    return 1;
+}
+
 int plat_mem_readable(uint64_t addr, uint64_t n) {
     for (uint64_t a = addr, end = addr + n; a < end || a == addr;) {
         MEMORY_BASIC_INFORMATION mbi;
@@ -791,7 +799,33 @@ void plat_aligned_free(void *p) { _aligned_free(p); }
 
 // ---- process
 
+#ifdef TOTK_PGO_GEN
+// compiler-rt's profile runtime (an instrumented build, tools/build_game.py --pgo gen). It writes its counters from an
+// atexit handler, which ExitProcess skips; __llvm_profile_dump writes them once and makes later writes no-ops.
+int __llvm_profile_dump(void);
+int __llvm_profile_write_file(void);
+void __llvm_profile_reset_counters(void);
+
+// A long played session must not lose its counts to a crash or a reboot: every minute the counters are added to the
+// .profraw (the file merges, -fprofile-generate's %m) and zeroed. Counts taken between the write and the reset are lost.
+static DWORD WINAPI pgo_flush_thread(void *arg) {
+    (void)arg;
+    for (;;) {
+        Sleep(60 * 1000);
+        if (__llvm_profile_write_file() == 0) __llvm_profile_reset_counters();
+    }
+}
+
+__attribute__((constructor)) static void pgo_flush_start(void) {
+    HANDLE h = CreateThread(NULL, 0, pgo_flush_thread, NULL, 0, NULL);
+    if (h) CloseHandle(h);
+}
+#endif
+
 void plat_exit(int code) {
+#ifdef TOTK_PGO_GEN
+    __llvm_profile_dump();
+#endif
     fflush(stdout);
     fflush(stderr);
     ExitProcess((UINT)code);
