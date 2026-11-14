@@ -38,30 +38,70 @@ jobs:
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
 
-      - name: Sync main, dev and tags
+      - name: Install git-filter-repo
         shell: bash
         run: |
+          python3 -m venv "$RUNNER_TEMP/git-filter-repo-venv"
+          "$RUNNER_TEMP/git-filter-repo-venv/bin/python" -m pip install --disable-pip-version-check --quiet git-filter-repo==2.47.0
+          echo "$RUNNER_TEMP/git-filter-repo-venv/bin" >> "$GITHUB_PATH"
+
+      - name: Sync main, dev and tags
+        shell: bash
+        env:
+          LEGACY_GIT_EMAIL: ${{ vars.LEGACY_GIT_EMAIL }}
+        run: |
           set -euo pipefail
-
-          UPSTREAM="https://github.com/valentderah/totk-pc-recomp.git"
-
-          git remote add upstream "$UPSTREAM"
+          UPSTREAM_URL="https://github.com/valentderah/totk-pc-recomp.git"
+          ORIGIN_URL="$(git remote get-url origin)"
+          git remote add upstream "$UPSTREAM_URL" 2>/dev/null || git remote set-url upstream "$UPSTREAM_URL"
 
           git fetch origin --prune
-          git fetch upstream --prune --tags
+          git fetch upstream --prune --force \
+            "+refs/heads/*:refs/remotes/upstream/*"
+          # Do not prune tags; preserve the existing mirror's stale-tag policy.
+          git fetch upstream --force "+refs/tags/*:refs/tags/*"
 
-          # Sync main while preserving this mirror workflow.
+          : "${LEGACY_GIT_EMAIL:?Set the LEGACY_GIT_EMAIL Actions variable before running this workflow}"
+          MAILMAP="$RUNNER_TEMP/git-mailmap"
+          printf '<%s> <%s>\n' '165035502+ZuanCrisp@users.noreply.github.com' "$LEGACY_GIT_EMAIL" > "$MAILMAP"
+          mapfile -t SANITIZE_REFS < <(
+            {
+              git for-each-ref --format='%(refname)' refs/remotes/upstream/
+              git for-each-ref --format='%(refname)' refs/tags/
+            } | sort -u
+          )
+          if ((${#SANITIZE_REFS[@]} == 0)); then
+            echo "::error::No upstream refs or tags were fetched for sanitization."
+            exit 1
+          fi
+          git filter-repo --force --mailmap "$MAILMAP" --refs "${SANITIZE_REFS[@]}"
+
+          # Partial filtering should retain remotes; reassert their URLs defensively.
+          git remote add origin "$ORIGIN_URL" 2>/dev/null || git remote set-url origin "$ORIGIN_URL"
+          git remote add upstream "$UPSTREAM_URL" 2>/dev/null || git remote set-url upstream "$UPSTREAM_URL"
+          git fetch origin --prune
+
+          # Refuse to publish if the old address survived in fetched refs.
+          if git log --format='%ae%n%ce' "${SANITIZE_REFS[@]}" | grep -Fqi -- "$LEGACY_GIT_EMAIL"; then
+            echo "::error::Legacy email remains in fetched source history after sanitization."
+            exit 1
+          fi
+          if git for-each-ref --format='%(taggeremail)' refs/tags/ | grep -Fqi -- "$LEGACY_GIT_EMAIL"; then
+            echo "::error::Legacy email remains in an annotated tag after sanitization."
+            exit 1
+          fi
+
           git switch main
-          git merge --no-edit upstream/main
+          git merge --no-edit refs/remotes/upstream/main
           git push origin main
 
-          # Keep dev exactly aligned with upstream.
+          # Preserve the existing behavior: dev follows upstream exactly.
           git push --force origin \
             refs/remotes/upstream/dev:refs/heads/dev
 
-          # Mirror all upstream tags.
+          # Tags are sanitized before being mirrored.
           git push origin --tags
-
+          echo "Sanitized main, dev and tags synchronized."
       - name: Mirror all stable and pre-releases
         env:
           GH_TOKEN: ${{ github.token }}
